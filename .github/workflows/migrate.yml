@@ -49,10 +49,7 @@ jobs:
                 CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
                 DRY_RUN: ${{ github.event.inputs.dry_run }}
               run: | 
-                python agent.py \ 
-                  --source ./source_repo \
-                  --target ./target_repo \
-                  --dry-run $DRY_RUN
+                python agent.py --source ./source_repo --target ./target_repo --dry-run ${{ github.event.inputs.dry_run }}
 
             - name: Commit and push to target repo
               if: ${{ github.event.inputs.dry_run == 'false' }}
