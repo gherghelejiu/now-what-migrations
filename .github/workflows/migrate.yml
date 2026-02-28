@@ -1,0 +1,78 @@
+name: Convex -> Supabase Migration Agent
+
+on: 
+    workflow_dispatch:
+        inputs: 
+            dry_run:
+                description: "Dry run (analyze only, don't push)"
+                required: false
+                default: "false"
+                type: choice
+                options: 
+                    - "false"
+                    - "true"
+
+jobs: 
+    migrate: 
+        name: Run Migration Agent
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+
+        steps: 
+            - name: Checkout this workflow repo
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with: 
+                python-version: "3.11"
+
+            - name: Install Python dependencies
+              run: pip install requests gitpython
+
+            - name: Configure Git identity
+              run: |
+                git config --global user.email "migration-agent@github-actions"
+                git config --global user.name "Migration Agent"
+
+            - name: Clone source repo (now-what)
+              run: | 
+                git clone https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what.git source_repo
+
+            - name: Clone target repo (now-what-supabase)
+              run: | 
+                git clone https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what-supabase.git target_repo || \
+                (mkdir target_repo && cd target_repo && git init && git remote add origin https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what-supabase.git)
+
+            - name: Run migration agent
+              env: 
+                CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+                DRY_RUN: ${{ github.event.inputs.dry_run }}
+              run: | 
+                python agent.py \ 
+                  --source ./source_repo \
+                  --target ./target_repo \
+                  --dry-run $DRY_RUN
+
+            - name: Commit and push to target repo
+              if: ${{ github.event.inputs.dry_run == 'false' }}
+              env: 
+                TARGET_GITHUB_TOKEN: ${{ secrets.TARGET_GITHUB_TOKEN }}
+              run: | 
+                cd target_repo
+                git add -A 
+                git diff --cached --quiet && echo "No changes to commit" && exit 0
+                git commit -m "feat: migrate from Convex to Supabase
+                
+                Automated migration by convex-to-supabase agent
+                Source: https://github.com/gherghelejiu/now-what
+                Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                git push --force origin HEAD:main
+
+            - name: Upload migration report
+              if: always()
+              uses: actions/upload-artifact@v4
+              with: 
+                name: migration-report
+                path: migration_report.md
+                retention-days: 30
