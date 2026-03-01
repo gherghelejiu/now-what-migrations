@@ -19,7 +19,7 @@ import requests
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-3-5-sonnet-20240620"
+ANTHROPIC_MODEL = "claude-4-6-sonnet"
 MAX_TOKENS = 8000
 REQUEST_DELAY_SECONDS = 1.5
 
