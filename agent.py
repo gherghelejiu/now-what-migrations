@@ -2,11 +2,10 @@
 """
 Convex → Supabase Migration Agent
 Runs in GitHub Actions to port a React Native + Convex app to Supabase.
-Uses the Cursor API (Claude 3.5 Sonnet) for intelligent code transformation.
+Uses the Anthropic API (Claude 3.5 Sonnet) for intelligent code transformation.
 """
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -19,10 +18,10 @@ import requests
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-CURSOR_API_URL = "https://api.cursor.sh/v1/chat/completions"
-CURSOR_MODEL = "claude-3-5-sonnet-20241022"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
 MAX_TOKENS = 8000
-REQUEST_DELAY_SECONDS = 1.0  # Be polite to the API
+REQUEST_DELAY_SECONDS = 1.5
 
 IGNORE_DIRS = {
     "node_modules", ".git", ".expo", "dist", "build",
@@ -31,7 +30,6 @@ IGNORE_DIRS = {
 IGNORE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".ttf", ".otf",
     ".woff", ".woff2", ".mp4", ".mp3", ".zip", ".tar", ".gz",
-    ".lock",  # package-lock, yarn.lock handled separately
 }
 CODE_EXTENSIONS = {
     ".ts", ".tsx", ".js", ".jsx", ".json", ".md",
@@ -84,40 +82,38 @@ For files to delete:
 Only output files that need to change. Skip files with no Convex references."""
 
 
-# ─── CURSOR API ───────────────────────────────────────────────────────────────
+# ─── ANTHROPIC API ────────────────────────────────────────────────────────────
 
-def call_cursor_api(system: str, user: str, api_key: str, retries: int = 3) -> str:
-    """Call the Cursor API with retry logic."""
+def call_api(system: str, user: str, api_key: str, retries: int = 3) -> str:
+    """Call the Anthropic API with retry logic."""
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
     }
     payload = {
-        "model": CURSOR_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "model": ANTHROPIC_MODEL,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
         "max_tokens": MAX_TOKENS,
-        "temperature": 0.1,
     }
 
     for attempt in range(retries):
         try:
-            resp = requests.post(CURSOR_API_URL, headers=headers, json=payload, timeout=120)
+            resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            return data["content"][0]["text"]
         except requests.exceptions.HTTPError as e:
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1)
+                wait = 15 * (attempt + 1)
                 print(f"  ⏳ Rate limited. Waiting {wait}s...")
                 time.sleep(wait)
             elif attempt < retries - 1:
-                print(f"  ⚠️  HTTP error {resp.status_code}, retrying ({attempt+1}/{retries})...")
+                print(f"  ⚠️  HTTP {resp.status_code}, retrying ({attempt+1}/{retries})...")
                 time.sleep(3)
             else:
-                raise RuntimeError(f"Cursor API failed after {retries} attempts: {e}") from e
+                raise RuntimeError(f"Anthropic API failed after {retries} attempts: {e}") from e
         except requests.exceptions.Timeout:
             if attempt < retries - 1:
                 print(f"  ⏰ Timeout, retrying ({attempt+1}/{retries})...")
@@ -135,10 +131,8 @@ def iter_source_files(root: Path) -> Generator[Path, None, None]:
     for path in sorted(root.rglob("*")):
         if path.is_dir():
             continue
-        # Skip ignored directories anywhere in path
         if any(part in IGNORE_DIRS for part in path.parts):
             continue
-        # Skip binary/lock files
         if path.suffix in IGNORE_EXTENSIONS:
             continue
         yield path
@@ -158,8 +152,6 @@ def read_file_safe(path: Path, max_bytes: int = 80_000) -> str:
 def parse_file_blocks(response: str) -> list[dict]:
     """Parse <FILE> and <DELETE> blocks from the AI response."""
     changes = []
-
-    # Match <FILE path="...">content</FILE>
     file_pattern = re.compile(r'<FILE\s+path="([^"]+)">(.*?)</FILE>', re.DOTALL)
     for match in file_pattern.finditer(response):
         changes.append({
@@ -167,62 +159,48 @@ def parse_file_blocks(response: str) -> list[dict]:
             "path": match.group(1).lstrip("/"),
             "content": match.group(2).strip(),
         })
-
-    # Match <DELETE path="..." />
     delete_pattern = re.compile(r'<DELETE\s+path="([^"]+)"\s*/>')
     for match in delete_pattern.finditer(response):
-        changes.append({
-            "action": "delete",
-            "path": match.group(1).lstrip("/"),
-            "content": "",
-        })
-
+        changes.append({"action": "delete", "path": match.group(1).lstrip("/"), "content": ""})
     return changes
 
 
 def uses_convex(content: str) -> bool:
     """Quick check if a file likely references Convex."""
-    convex_markers = [
+    markers = [
         "from 'convex", 'from "convex',
         "useQuery", "useMutation", "useAction",
         "ConvexProvider", "ConvexReactClient",
         "api.", "convex/",
     ]
-    return any(marker in content for marker in convex_markers)
+    return any(m in content for m in markers)
 
 
 def batch(items: list, size: int) -> Generator[list, None, None]:
-    """Split a list into batches of given size."""
     for i in range(0, len(items), size):
-        yield items[i : i + size]
+        yield items[i: i + size]
 
 
 # ─── MIGRATION STEPS ──────────────────────────────────────────────────────────
 
 def step_analyze(source_root: Path) -> dict:
-    """Collect information about the codebase."""
     all_files = list(iter_source_files(source_root))
-    convex_files = [f for f in all_files if "convex" in str(f.relative_to(source_root)).split("/")[0]]
+    convex_files = [
+        f for f in all_files
+        if f.relative_to(source_root).parts and f.relative_to(source_root).parts[0] == "convex"
+    ]
     convex_using = [
         f for f in all_files
         if f.suffix in CODE_EXTENSIONS and uses_convex(read_file_safe(f))
     ]
-
     print(f"  Total source files:        {len(all_files)}")
     print(f"  convex/ backend files:     {len(convex_files)}")
     print(f"  Files that import Convex:  {len(convex_using)}")
-
-    return {
-        "all_files": all_files,
-        "convex_files": convex_files,
-        "convex_using": convex_using,
-    }
+    return {"all_files": all_files, "convex_files": convex_files, "convex_using": convex_using}
 
 
 def step_generate_schema(source_root: Path, api_key: str) -> list[dict]:
-    """Generate Supabase schema, types, and client config from Convex backend files."""
     print("  Reading Convex schema + backend files...")
-
     convex_dir = source_root / "convex"
     if not convex_dir.exists():
         print("  ⚠️  No convex/ directory found — will infer schema from app code")
@@ -256,8 +234,8 @@ Please generate ALL of the following files:
 4. `.env.example` — Template with EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY
 5. Updated `package.json` — Remove convex packages, add @supabase/supabase-js"""
 
-    print("  Calling Cursor API for schema generation...")
-    response = call_cursor_api(SYSTEM_PROMPT, prompt, api_key)
+    print("  Calling Anthropic API for schema generation...")
+    response = call_api(SYSTEM_PROMPT, prompt, api_key)
     changes = parse_file_blocks(response)
     print(f"  Generated {len(changes)} schema/config files")
     return changes
@@ -269,13 +247,11 @@ def step_migrate_files(
     context_summary: str,
     api_key: str,
 ) -> list[dict]:
-    """Migrate each file that uses Convex, in batches."""
     all_changes = []
     file_batches = list(batch(convex_using, 5))
 
     for i, file_batch in enumerate(file_batches):
         print(f"  Batch {i+1}/{len(file_batches)}: migrating {len(file_batch)} files...")
-
         files_content = []
         for f in file_batch:
             rel = f.relative_to(source_root)
@@ -290,16 +266,15 @@ def step_migrate_files(
 ## Files to migrate
 
 Migrate each of the following files from Convex to Supabase.
-Import the Supabase client from `../../supabase/config` (adjust relative path as needed).
-Import types from `../../supabase/types` (adjust relative path as needed).
+Import the Supabase client from `supabase/config` (adjust relative path as needed).
+Import types from `supabase/types` (adjust relative path as needed).
 
 {chr(10).join(files_content)}"""
 
-        response = call_cursor_api(SYSTEM_PROMPT, prompt, api_key)
+        response = call_api(SYSTEM_PROMPT, prompt, api_key)
         changes = parse_file_blocks(response)
         all_changes.extend(changes)
         print(f"    → {len(changes)} file changes generated")
-
         time.sleep(REQUEST_DELAY_SECONDS)
 
     return all_changes
@@ -311,7 +286,6 @@ def step_apply_changes(
     all_changes: list[dict],
     dry_run: bool,
 ) -> dict:
-    """Copy source → target, remove convex/, apply AI changes."""
     stats = {"copied": 0, "written": 0, "deleted": 0, "skipped": 0}
 
     if dry_run:
@@ -320,11 +294,9 @@ def step_apply_changes(
         stats["deleted"] = len([c for c in all_changes if c["action"] == "delete"])
         return stats
 
-    # 1. Copy entire source → target (excluding convex/ and node_modules)
     print("  Copying source → target (excluding convex/)...")
     for src_file in iter_source_files(source_root):
         rel = src_file.relative_to(source_root)
-        # Skip the convex/ directory entirely
         if rel.parts and rel.parts[0] == "convex":
             continue
         dest = target_root / rel
@@ -332,7 +304,6 @@ def step_apply_changes(
         shutil.copy2(src_file, dest)
         stats["copied"] += 1
 
-    # 2. Apply AI-generated changes
     print(f"  Applying {len(all_changes)} AI-generated changes...")
     for change in all_changes:
         dest = target_root / change["path"]
@@ -351,9 +322,7 @@ def step_apply_changes(
 
 
 def build_context_summary(source_root: Path) -> str:
-    """Build a compact project context string for the AI."""
     parts = []
-
     priority_files = [
         "package.json", "app.json", "tsconfig.json",
         "App.tsx", "app/_layout.tsx", "app/index.tsx",
@@ -362,36 +331,25 @@ def build_context_summary(source_root: Path) -> str:
         p = source_root / name
         if p.exists():
             content = read_file_safe(p)
-            # Truncate large files
             if len(content) > 2000:
                 content = content[:2000] + "\n...[truncated]"
             parts.append(f"=== {name} ===\n{content}")
-
     summary = "\n\n".join(parts)
-    # Hard cap at 4000 chars for context
     return summary[:4000] if len(summary) > 4000 else summary
 
 
-def write_report(
-    source_root: Path,
-    all_changes: list[dict],
-    stats: dict,
-    dry_run: bool,
-) -> None:
-    """Write a markdown migration report."""
+def write_report(all_changes: list[dict], stats: dict, dry_run: bool) -> None:
     written = [c for c in all_changes if c["action"] == "write"]
     deleted = [c for c in all_changes if c["action"] == "delete"]
-
     lines = [
         "# Migration Report: Convex → Supabase",
         "",
-        f"**Source:** `{source_root}`",
         f"**Dry run:** `{dry_run}`",
         "",
         "## Summary",
         "",
-        f"| Action | Count |",
-        f"|--------|-------|",
+        "| Action | Count |",
+        "|--------|-------|",
         f"| Files copied (unchanged) | {stats.get('copied', 0)} |",
         f"| Files written/created by AI | {stats.get('written', 0)} |",
         f"| Files deleted | {stats.get('deleted', 0)} |",
@@ -401,12 +359,10 @@ def write_report(
     ]
     for c in written:
         lines.append(f"- `{c['path']}`")
-
     if deleted:
         lines += ["", "## Files Deleted", ""]
         for c in deleted:
             lines.append(f"- `{c['path']}`")
-
     lines += [
         "",
         "## Next Steps",
@@ -417,7 +373,6 @@ def write_report(
         "4. Run `npm install` then `npx expo start`",
         "5. Review RLS policies in the migration SQL — tighten as needed",
     ]
-
     report_path = Path("migration_report.md")
     report_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"\n📄 Report written to {report_path}")
@@ -429,31 +384,26 @@ def main():
     parser = argparse.ArgumentParser(description="Convex → Supabase migration agent")
     parser.add_argument("--source", required=True, help="Path to cloned source repo")
     parser.add_argument("--target", required=True, help="Path to cloned target repo")
-    parser.add_argument(
-        "--dry-run",
-        default="false",
-        choices=["true", "false"],
-        help="If true, analyze only and don't write files",
-    )
+    parser.add_argument("--dry-run", default="false", choices=["true", "false"])
     args = parser.parse_args()
 
     dry_run = args.dry_run.lower() == "true"
     source_root = Path(args.source).resolve()
     target_root = Path(args.target).resolve()
 
-    api_key = os.environ.get("CURSOR_API_KEY", "")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        print("❌ CURSOR_API_KEY environment variable is not set", file=sys.stderr)
+        print("❌ ANTHROPIC_API_KEY environment variable is not set", file=sys.stderr)
         sys.exit(1)
 
     print("\n🤖 Convex → Supabase Migration Agent")
     print("=" * 50)
-    print(f"   Source: {source_root}")
-    print(f"   Target: {target_root}")
+    print(f"   Source:  {source_root}")
+    print(f"   Target:  {target_root}")
     print(f"   Dry run: {dry_run}")
+    print(f"   Model:   {ANTHROPIC_MODEL}")
     print("=" * 50)
 
-    # ── Step 1: Analyze ──────────────────────────────────────────────────────
     print("\n🔍 Step 1: Analyzing codebase...")
     analysis = step_analyze(source_root)
 
@@ -461,35 +411,27 @@ def main():
         print("⚠️  No Convex usage detected. Nothing to migrate.")
         sys.exit(0)
 
-    # ── Step 2: Build context ────────────────────────────────────────────────
     print("\n📋 Step 2: Building project context...")
     context_summary = build_context_summary(source_root)
 
-    # ── Step 3: Generate Supabase schema & config ────────────────────────────
     print("\n📊 Step 3: Generating Supabase schema, types, and config...")
     schema_changes = step_generate_schema(source_root, api_key)
     time.sleep(REQUEST_DELAY_SECONDS)
 
-    # ── Step 4: Migrate app files ────────────────────────────────────────────
     print(f"\n🔄 Step 4: Migrating {len(analysis['convex_using'])} files that use Convex...")
     app_changes = step_migrate_files(
-        source_root,
-        analysis["convex_using"],
-        context_summary,
-        api_key,
+        source_root, analysis["convex_using"], context_summary, api_key,
     )
 
     all_changes = schema_changes + app_changes
     print(f"\n✅ Total AI-generated changes: {len(all_changes)}")
 
-    # ── Step 5: Apply changes ────────────────────────────────────────────────
     print("\n✍️  Step 5: Applying changes to target repo...")
     stats = step_apply_changes(source_root, target_root, all_changes, dry_run)
     print(f"   Copied: {stats['copied']}  Written: {stats['written']}  Deleted: {stats['deleted']}")
 
-    # ── Step 6: Write report ─────────────────────────────────────────────────
     print("\n📄 Step 6: Writing migration report...")
-    write_report(source_root, all_changes, stats, dry_run)
+    write_report(all_changes, stats, dry_run)
 
     print("\n🎉 Agent finished successfully!")
     if dry_run:
