@@ -19,7 +19,7 @@ import requests
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
+ANTHROPIC_MODEL = "claude-3-5-sonnet-20240620"
 MAX_TOKENS = 8000
 REQUEST_DELAY_SECONDS = 1.5
 
@@ -105,15 +105,17 @@ def call_api(system: str, user: str, api_key: str, retries: int = 3) -> str:
             data = resp.json()
             return data["content"][0]["text"]
         except requests.exceptions.HTTPError as e:
+            body = resp.text[:500]
+            print(f"  ❌ HTTP {resp.status_code}: {body}")
             if resp.status_code == 429:
                 wait = 15 * (attempt + 1)
                 print(f"  ⏳ Rate limited. Waiting {wait}s...")
                 time.sleep(wait)
             elif attempt < retries - 1:
-                print(f"  ⚠️  HTTP {resp.status_code}, retrying ({attempt+1}/{retries})...")
+                print(f"  ⚠️  Retrying ({attempt+1}/{retries})...")
                 time.sleep(3)
             else:
-                raise RuntimeError(f"Anthropic API failed after {retries} attempts: {e}") from e
+                raise RuntimeError(f"Anthropic API failed: {resp.status_code} {body}") from e
         except requests.exceptions.Timeout:
             if attempt < retries - 1:
                 print(f"  ⏰ Timeout, retrying ({attempt+1}/{retries})...")
