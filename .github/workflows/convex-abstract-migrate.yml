@@ -3,8 +3,16 @@ name: Convex → Abstract Migration Agent
 on:
   workflow_dispatch:
     inputs:
+      source_repo:
+        description: "Source repo (org/name) — the Convex app"
+        required: true
+        default: "gherghelejiu/now-what"
+      target_repo:
+        description: "Target repo (org/name) — where abstracted code is pushed"
+        required: true
+        default: "gherghelejiu/now-what-abstract"
       dry_run:
-        description: "Dry run (analyze only, don't push)"
+        description: "Dry run (analyse + show checkpoint state, no writes)"
         required: false
         default: "false"
         type: choice
@@ -37,12 +45,12 @@ jobs:
 
       - name: Clone source repo (now-what)
         run: |
-          git clone https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what.git source_repo
+          git clone https://x-access-token:${{ secrets.SOURCE_GITHUB_TOKEN }}@github.com/${{ github.event.inputs.source_repo }}.git source_repo
 
       - name: Clone target repo (now-what-abstract)
         run: |
-          git clone https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what-abstract.git target_repo || \
-          (mkdir target_repo && cd target_repo && git init && git remote add origin https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/gherghelejiu/now-what-abstract.git)
+          git clone https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ github.event.inputs.target_repo }}.git target_repo || \
+          (mkdir target_repo && cd target_repo && git init && git remote add origin https://x-access-token:${{ secrets.TARGET_GITHUB_TOKEN }}@github.com/${{ github.event.inputs.target_repo }}.git)
 
       - name: Run migration agent
         env:
@@ -61,7 +69,7 @@ jobs:
           git commit -m "feat: migrate from Convex to Abstract
 
           Automated migration by convex-to-abstract agent
-          Source: https://github.com/gherghelejiu/now-what
+          Source: https://github.com/${{ github.event.inputs.source_repo }}
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           git push --force origin HEAD:main
 
